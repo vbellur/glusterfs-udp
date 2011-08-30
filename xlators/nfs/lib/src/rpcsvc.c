@@ -508,6 +508,7 @@ nfs_rpcsvc_conn_peer_check_name (dict_t *options, char *volname,
         ret = nfs_rpcsvc_combine_allow_reject_volume_check (aret, rjret);
 
 err:
+        ret = RPCSVC_AUTH_ACCEPT;
         return ret;
 }
 
@@ -884,6 +885,34 @@ err:
         return conn;
 }
 
+rpcsvc_conn_t *
+nfs_rpcsvc_udp_conn_listen_init (rpcsvc_t *svc, rpcsvc_program_t *newprog)
+{
+        rpcsvc_conn_t  *conn = NULL;
+        int             sock = -1;
+
+        if (!newprog)
+                return NULL;
+
+        sock = nfs_rpcsvc_udp_socket_listen (newprog->progaddrfamily,
+                                             newprog->proghost, newprog->progport);
+        if (sock == -1)
+                goto err;
+
+        conn = nfs_rpcsvc_conn_init (svc, sock);
+        if (!conn)
+                goto sock_close_err;
+
+        nfs_rpcsvc_conn_state_init (conn);
+sock_close_err:
+        if (!conn)
+                close (sock);
+
+err:
+        return conn;
+}
+
+
 void
 nfs_rpcsvc_record_init (rpcsvc_record_state_t *rs, struct iobuf_pool *pool)
 {
@@ -919,6 +948,40 @@ nfs_rpcsvc_record_init (rpcsvc_record_state_t *rs, struct iobuf_pool *pool)
 
 }
 
+void
+nfs_rpcsvc_udp_record_init (rpcsvc_record_state_t *rs, struct iobuf_pool *pool)
+{
+        if (!rs)
+                return;
+
+        rs->state = RPCSVC_READ_FRAG;
+        rs->vecstate = 0;
+        rs->remainingfraghdr = 0;
+        rs->remainingfrag = 0;
+        rs->fragsize = 0;
+        rs->recordsize = 0;
+        rs->islastfrag = 1;
+
+        /* If the rs preserves a ref to the iob used by the previous request,
+         * we must unref it here to prevent memory leak.
+         * If program actor wanted to keep that memory around, it should've
+         * refd it on entry into the actor.
+         */
+        if (rs->activeiob)
+                iobuf_unref (rs->activeiob);
+
+        if (rs->vectoriob) {
+                iobuf_unref (rs->vectoriob);
+                rs->vectoriob = NULL;
+        }
+
+        rs->activeiob = iobuf_get (pool);
+        rs->fragcurrent = iobuf_ptr (rs->activeiob);
+
+        memset (rs->fragheader, 0, RPCSVC_FRAGHDR_SIZE);
+        rs->hdrcurrent = &rs->fragheader[0];
+
+}
 
 int
 nfs_rpcsvc_conn_privport_check (rpcsvc_t *svc, char *volname,
@@ -1041,6 +1104,32 @@ err:
         return newconn;
 }
 
+rpcsvc_conn_t *
+nfs_rpcsvc_conn_udp_init (rpcsvc_t *svc, int listenfd)
+{
+        rpcsvc_conn_t   *newconn = NULL;
+        int             sock = -1;
+        int             ret = -1;
+
+        sock = dup (listenfd);
+
+        newconn = nfs_rpcsvc_conn_init (svc, sock);
+        if (!newconn) {
+                gf_log (GF_RPCSVC, GF_LOG_ERROR, "Failed to init conn object");
+                ret = -1;
+                goto err;
+        }
+
+        nfs_rpcsvc_udp_record_init (&newconn->rstate, svc->ctx->iobuf_pool);
+        nfs_rpcsvc_conn_state_init (newconn);
+        ret = 0;
+
+err:
+        if (ret == -1)
+                close (sock);
+
+        return newconn;
+}
 
 /* Once the connection has been created, we need to associate it with
  * a stage so that the selected stage will handle the event on this connection.
@@ -1130,7 +1219,10 @@ nfs_rpcsvc_record_read_complete_fraghdr (rpcsvc_record_state_t *rs,
         rs->state = RPCSVC_READ_FRAG;
         dataread -= remhdr;
         rs->remainingfraghdr -= remhdr;
-        rs->islastfrag = RPCSVC_LASTFRAG (fraghdr);
+        if (fraghdr)
+                rs->islastfrag = RPCSVC_LASTFRAG (fraghdr);
+        else
+                rs->islastfrag = 1;
 
         return dataread;
 }
@@ -1449,18 +1541,23 @@ nfs_rpcsvc_set_last_frag_header_size (uint32_t size, char *haddr)
  * encode the RPC record header into the buffer pointed by recordstart.
  */
 struct iovec
-nfs_rpcsvc_record_build_header (char *recordstart, size_t rlen,
+nfs_rpcsvc_record_build_header (rpcsvc_conn_t *conn, char *recordstart, size_t rlen,
                                 struct rpc_msg reply, size_t payload)
 {
         struct iovec    replyhdr;
         struct iovec    txrecord = {0, 0};
         size_t          fraglen = 0;
         int             ret = -1;
+        int             fraghdrsize = RPCSVC_FRAGHDR_SIZE;
 
         /* After leaving aside the 4 bytes for the fragment header, lets
          * encode the RPC reply structure into the buffer given to us.
          */
-        ret = nfs_rpc_reply_to_xdr (&reply,(recordstart + RPCSVC_FRAGHDR_SIZE),
+        if (conn->is_udp) {
+                fraghdrsize = 0;
+        }
+
+        ret = nfs_rpc_reply_to_xdr (&reply,(recordstart + fraghdrsize),
                                     rlen, &replyhdr);
         if (ret == -1) {
                 gf_log (GF_RPCSVC, GF_LOG_ERROR, "Failed to create RPC reply");
@@ -1475,9 +1572,10 @@ nfs_rpcsvc_record_build_header (char *recordstart, size_t rlen,
          * we just set this fragment as the first and last fragment for this
          * record.
          */
-        nfs_rpcsvc_set_last_frag_header_size (fraglen, recordstart);
+        if (!conn->is_udp)
+                nfs_rpcsvc_set_last_frag_header_size (fraglen, recordstart);
 
-        /* Even though the RPC record starts at recordstart+RPCSVC_FRAGHDR_SIZE
+        /* Even though the RPC record starts at recordstart+fraghdrsize
          * we need to transmit the record with the fragment header, which starts
          * at recordstart.
          */
@@ -1488,12 +1586,84 @@ nfs_rpcsvc_record_build_header (char *recordstart, size_t rlen,
          * the size of the full fragment. This size is sent in the fragment
          * header.
          */
-        txrecord.iov_len = RPCSVC_FRAGHDR_SIZE + replyhdr.iov_len;
+        txrecord.iov_len = fraghdrsize + replyhdr.iov_len;
 
 err:
         return txrecord;
 }
 
+int
+nfs_rpcsvc_udp_submit (rpcsvc_conn_t *conn, struct iovec hdr,
+                        struct iobuf *hdriob, struct iovec msgvec,
+                        struct iobuf *msgiob)
+{
+        int     ret = -1;
+        struct iovec iov = {0,};
+        struct iobuf *iobuf = NULL;
+        char   *buf = NULL;
+        rpcsvc_t *svc = NULL;
+        size_t  size = 0;
+
+        if ((!conn) || (!hdr.iov_base) || (!hdriob))
+                return -1;
+
+        gf_log (GF_RPCSVC, GF_LOG_TRACE, "Tx Header: %zu, payload: %zu",
+                hdr.iov_len, msgvec.iov_len);
+        /* Now that we have both the RPC and Program buffers in xdr format
+         * lets hand it to the transmission layer.
+         */
+        pthread_mutex_lock (&conn->connlock);
+        {
+                if (!nfs_rpcsvc_conn_check_active (conn)) {
+                        gf_log (GF_RPCSVC, GF_LOG_DEBUG, "Connection inactive");
+                        goto unlock_err;
+                }
+
+                if (msgiob)
+                        size = hdr.iov_len + msgvec.iov_len;
+                else
+                        size = hdr.iov_len;
+
+                svc = nfs_rpcsvc_conn_rpcsvc (conn);
+                iobuf = iobuf_get (svc->ctx->iobuf_pool);
+                if (!iobuf)
+                        goto unlock_err;
+
+                buf = iobuf->ptr;
+
+                memcpy (buf, hdr.iov_base, hdr.iov_len);
+
+                if (msgiob)
+                        memcpy (buf + hdr.iov_len, msgvec.iov_base, msgvec.iov_len);
+
+                iov.iov_base = buf;
+                iov.iov_len = size;
+
+                ret = nfs_rpcsvc_conn_append_txlist (conn, iov, iobuf,
+                                                     RPCSVC_TXB_FIRST);
+                if (ret == -1) {
+                        gf_log (GF_RPCSVC, GF_LOG_ERROR, "Failed to append "
+                                "header to transmission list");
+                        goto unlock_err;
+                }
+
+        }
+unlock_err:
+        pthread_mutex_unlock (&conn->connlock);
+
+        if (ret == -1)
+                goto err;
+
+        /* Tell event pool, we're interested in poll_out to trigger flush
+         * of our tx buffers.
+         */
+        conn->eventidx = event_select_on (conn->stage->eventpool, conn->sockfd,
+                                          conn->eventidx, -1, 1);
+        ret = 0;
+err:
+
+        return ret;
+}
 
 int
 nfs_rpcsvc_conn_submit (rpcsvc_conn_t *conn, struct iovec hdr,
@@ -1629,7 +1799,7 @@ nfs_rpcsvc_record_build_record (rpcsvc_request_t *req, size_t payload,
 
         /* Fill the rpc structure and XDR it into the buffer got above. */
         nfs_rpcsvc_fill_reply (req, &reply);
-        recordhdr = nfs_rpcsvc_record_build_header (record, pagesize, reply,
+        recordhdr = nfs_rpcsvc_record_build_header (conn, record, pagesize, reply,
                                                     payload);
         if (!recordhdr.iov_base) {
                 gf_log (GF_RPCSVC, GF_LOG_ERROR, "Failed to build record "
@@ -1704,7 +1874,10 @@ nfs_rpcsvc_submit_generic (rpcsvc_request_t *req, struct iovec msgvec,
          */
         if (msg)
                 iobuf_ref (msg);
-        ret = nfs_rpcsvc_conn_submit (conn, recordhdr, replyiob, msgvec, msg);
+        if (conn->is_udp)
+                ret = nfs_rpcsvc_udp_submit (conn, recordhdr, replyiob, msgvec, msg);
+        else
+                ret = nfs_rpcsvc_conn_submit (conn, recordhdr, replyiob, msgvec, msg);
 
         if (ret == -1) {
                 gf_log (GF_RPCSVC, GF_LOG_ERROR, "Failed to submit message");
@@ -2483,6 +2656,8 @@ nfs_rpcsvc_record_update_state (rpcsvc_conn_t *conn, ssize_t dataread)
                 } else if (dataread > 0) {
                         gf_log (GF_RPCSVC, GF_LOG_TRACE, "Regular frag");
                         dataread = nfs_rpcsvc_record_update_frag (rs, dataread);
+                        if (!rs->remainingfrag)
+                                rs->islastfrag = 1;
                 }
         }
 
@@ -2553,11 +2728,38 @@ err:
         return ret;
 }
 
+int
+nfs_rpcsvc_udp_data_poll_in (rpcsvc_conn_t *conn)
+{
+        ssize_t         dataread = -1;
+        size_t          readsize = 0;
+        char            *readaddr = NULL;
+        int             ret = -1;
+
+        readaddr = nfs_rpcsvc_record_read_addr (&conn->rstate);
+        if (!readaddr)
+                goto err;
+
+        dataread = nfs_rpcsvc_udp_socket_read (conn, conn->sockfd, readaddr, 4096);
+        gf_log (GF_RPCSVC, GF_LOG_TRACE, "conn: 0x%lx, readsize: %zu, dataread:"
+                "%zd", (long)conn, readsize, dataread);
+
+        if (dataread > 0) {
+                conn->rstate.fragsize = dataread;
+                conn->rstate.remainingfrag = dataread;
+                ret = nfs_rpcsvc_record_update_state (conn, dataread);
+        }
+
+err:
+        return ret;
+}
 
 int
 nfs_rpcsvc_conn_data_poll_err (rpcsvc_conn_t *conn)
 {
         gf_log (GF_RPCSVC, GF_LOG_TRACE, "Received error event");
+        if (conn->is_udp)
+                return 0;
         nfs_rpcsvc_conn_deinit (conn);
         return 0;
 }
@@ -2584,18 +2786,24 @@ tx_remaining:
                 writesize = (txbuf->buf.iov_len - txbuf->offset);
 
                 if (txbuf->txbehave & RPCSVC_TXB_FIRST) {
-                        gf_log (GF_RPCSVC, GF_LOG_TRACE, "First Tx Buf");
+                        //gf_log (GF_RPCSVC, GF_LOG_TRACE, "First Tx Buf");
                         nfs_rpcsvc_socket_block_tx (conn->sockfd);
                 }
 
-                written = nfs_rpcsvc_socket_write (conn->sockfd, writeaddr,
+                if (!conn->is_udp) {
+                        written = nfs_rpcsvc_socket_write (conn->sockfd, writeaddr,
                                                    writesize, &eagain);
+                } else {
+                        written = nfs_rpcsvc_udp_write (conn, conn->sockfd, writeaddr,
+                                                        writesize);
+
+                }
                 if (txbuf->txbehave & RPCSVC_TXB_LAST) {
-                        gf_log (GF_RPCSVC, GF_LOG_TRACE, "Last Tx Buf");
+                    //    gf_log (GF_RPCSVC, GF_LOG_TRACE, "Last Tx Buf");
                         nfs_rpcsvc_socket_unblock_tx (conn->sockfd);
                 }
-                gf_log (GF_RPCSVC, GF_LOG_TRACE, "conn: 0x%lx, Tx request: %zu,"
-                        " Tx sent: %zd", (long)conn, writesize, written);
+                //gf_log (GF_RPCSVC, GF_LOG_TRACE, "conn: 0x%lx, Tx request: %zu,"
+                  //      " Tx sent: %zd", (long)conn, writesize, written);
 
                 /* There was an error transmitting this buffer */
                 if (written == -1)
@@ -2696,6 +2904,36 @@ nfs_rpcsvc_conn_data_handler (int fd, int idx, void *data, int poll_in,
         return 0;
 }
 
+int
+nfs_rpcsvc_udp_data_handler (int fd, int idx, void *data, int poll_in,
+                              int poll_out, int poll_err)
+{
+        rpcsvc_conn_t   *conn = NULL;
+        int             ret = 0;
+
+        if (!data)
+                return 0;
+
+        conn = (rpcsvc_conn_t *)data;
+
+        if (poll_out)
+                ret = nfs_rpcsvc_conn_data_poll_out (conn);
+
+        if (poll_err) {
+                ret = nfs_rpcsvc_conn_data_poll_err (conn);
+                return 0;
+        }
+
+        if (poll_in) {
+                ret = 0;
+                ret = nfs_rpcsvc_udp_data_poll_in (conn);
+        }
+
+        if (ret == -1)
+                nfs_rpcsvc_conn_data_poll_err (conn);
+
+        return 0;
+}
 
 int
 nfs_rpcsvc_conn_listening_handler (int fd, int idx, void *data, int poll_in,
@@ -2743,6 +2981,51 @@ err:
         return ret;
 }
 
+int
+nfs_rpcsvc_conn_udp_handler (int fd, int idx, void *data, int poll_in,
+                                   int poll_out, int poll_err)
+{
+        rpcsvc_conn_t           *newconn = NULL;
+        rpcsvc_stage_t          *selectedstage = NULL;
+        int                     ret = -1;
+        rpcsvc_conn_t           *conn = NULL;
+        rpcsvc_t                *svc = NULL;
+
+        if (!poll_in)
+                return 0;
+
+        conn = (rpcsvc_conn_t *)data;
+        svc = nfs_rpcsvc_conn_rpcsvc (conn);
+        newconn = nfs_rpcsvc_conn_udp_init (svc, fd);
+        if (!newconn) {
+                gf_log (GF_RPCSVC, GF_LOG_ERROR, "failed to accept connection");
+                goto err;
+        }
+
+        selectedstage = nfs_rpcsvc_select_stage (svc);
+        if (!selectedstage)
+                goto close_err;
+
+        /* Now that we've accepted the connection, we need to associate
+         * its events to a stage.
+         */
+        ret = nfs_rpcsvc_stage_conn_associate (selectedstage, newconn,
+                                               nfs_rpcsvc_udp_data_handler,
+                                               newconn);
+        if (ret == -1) {
+                gf_log (GF_RPCSVC, GF_LOG_ERROR, "could not associate stage "
+                        " with new connection");
+                goto close_err;
+        }
+        gf_log (GF_RPCSVC, GF_LOG_DEBUG, "New Connection");
+        ret = 0;
+close_err:
+        if (ret == -1)
+                nfs_rpcsvc_conn_unref (newconn);
+
+err:
+        return ret;
+}
 
 /* Register the program with the local portmapper service. */
 int
@@ -2764,6 +3047,24 @@ nfs_rpcsvc_program_register_portmap (rpcsvc_t *svc, rpcsvc_program_t *newprog)
         return 0;
 }
 
+int
+nfs_rpcsvc_udp_program_register_portmap (rpcsvc_t *svc, rpcsvc_program_t *newprog)
+{
+        if (!newprog)
+                return -1;
+
+        if (!svc->register_portmap)
+                return 0;
+
+        if (!(pmap_set(newprog->prognum, newprog->progver, IPPROTO_UDP,
+                       newprog->progport))) {
+                gf_log (GF_RPCSVC, GF_LOG_ERROR, "Could not register with"
+                        " portmap");
+                return -1;
+        }
+
+        return 0;
+}
 
 int
 nfs_rpcsvc_program_unregister_portmap (rpcsvc_t *svc, rpcsvc_program_t *prog)
@@ -2814,6 +3115,35 @@ nfs_rpcsvc_stage_program_register (rpcsvc_stage_t *stg,
         return 0;
 }
 
+int
+nfs_rpcsvc_stage_udp_program_register (rpcsvc_stage_t *stg,
+                                       rpcsvc_program_t *newprog)
+{
+        rpcsvc_conn_t           *newconn = NULL;
+        rpcsvc_t                *svc = NULL;
+
+        if ((!stg) || (!newprog))
+                return -1;
+
+        svc = nfs_rpcsvc_stage_service (stg);
+        /* Create a listening socket */
+        newconn = nfs_rpcsvc_udp_conn_listen_init (svc, newprog);
+        if (!newconn) {
+                gf_log (GF_RPCSVC, GF_LOG_ERROR, "could not create listening"
+                        " connection");
+                return -1;
+        }
+
+        if ((nfs_rpcsvc_stage_conn_associate (stg, newconn,
+                                              nfs_rpcsvc_conn_udp_handler,
+                                              newconn)) == -1) {
+                gf_log (GF_RPCSVC, GF_LOG_ERROR,"could not associate stage with"
+                        " listening connection");
+                return -1;
+        }
+
+        return 0;
+}
 
 int
 nfs_rpcsvc_program_register (rpcsvc_t *svc, rpcsvc_program_t program)
@@ -2845,6 +3175,59 @@ nfs_rpcsvc_program_register (rpcsvc_t *svc, rpcsvc_program_t program)
         }
 
         ret = nfs_rpcsvc_program_register_portmap (svc, newprog);
+        if (ret == -1) {
+                gf_log (GF_RPCSVC, GF_LOG_ERROR, "portmap registration of"
+                        " program failed");
+                goto free_prog;
+        }
+
+        ret = 0;
+        gf_log (GF_RPCSVC, GF_LOG_DEBUG, "New program registered: %s, Num: %d,"
+                " Ver: %d, Port: %d", newprog->progname, newprog->prognum,
+                newprog->progver, newprog->progport);
+
+free_prog:
+        if (ret == -1) {
+                gf_log (GF_RPCSVC, GF_LOG_ERROR, "Program registration failed:"
+                        " %s, Num: %d, Ver: %d, Port: %d", newprog->progname,
+                        newprog->prognum, newprog->progver, newprog->progport);
+                list_del (&newprog->proglist);
+                GF_FREE (newprog);
+        }
+
+        return ret;
+}
+
+int
+nfs_rpcsvc_udp_program_register (rpcsvc_t *svc, rpcsvc_program_t program)
+{
+        rpcsvc_program_t        *newprog = NULL;
+        rpcsvc_stage_t          *selectedstage = NULL;
+        int                     ret = -1;
+
+        if (!svc)
+                return -1;
+
+        newprog = GF_CALLOC (1, sizeof(*newprog),gf_common_mt_rpcsvc_program_t);
+        if (!newprog)
+                return -1;
+
+        if (!program.actors)
+                goto free_prog;
+
+        memcpy (newprog, &program, sizeof (program));
+        INIT_LIST_HEAD (&newprog->proglist);
+        list_add_tail (&newprog->proglist, &svc->allprograms);
+        selectedstage = nfs_rpcsvc_select_stage (svc);
+
+        ret = nfs_rpcsvc_stage_udp_program_register (selectedstage, newprog);
+        if (ret == -1) {
+                gf_log (GF_RPCSVC, GF_LOG_ERROR, "stage registration of program"
+                        " failed");
+                goto free_prog;
+        }
+
+        ret = nfs_rpcsvc_udp_program_register_portmap (svc, newprog);
         if (ret == -1) {
                 gf_log (GF_RPCSVC, GF_LOG_ERROR, "portmap registration of"
                         " program failed");
@@ -2922,6 +3305,12 @@ nfs_rpcsvc_conn_peername (rpcsvc_conn_t *conn, char *hostname, int hostlen)
         if (!conn)
                 return -1;
 
+        if (conn->is_udp) {
+                if (hostname)
+                        strcpy (hostname, "127.0.0.1");
+                return 0;
+        }
+
         return nfs_rpcsvc_socket_peername (conn->sockfd, hostname, hostlen);
 }
 
@@ -2932,6 +3321,12 @@ nfs_rpcsvc_conn_peeraddr (rpcsvc_conn_t *conn, char *addrstr, int addrlen,
 {
         if (!conn)
                 return -1;
+
+        if (conn->is_udp) {
+                if (sa)
+                        memcpy (sa, &conn->addr, conn->sockaddrlen);
+                return 0;
+        }
 
         return nfs_rpcsvc_socket_peeraddr (conn->sockfd, addrstr, addrlen, sa,
                                            sasize);

@@ -131,11 +131,6 @@ nfs_rpcsvc_socket_listen (int addrfam, char *listenhost, uint16_t listenport)
         }
 
         ret = listen (sock, 10);
-        if (ret == -1) {
-                gf_log (GF_RPCSVC_SOCK, GF_LOG_ERROR, "could not listen on"
-                        " socket (%s)", strerror (errno));
-                goto close_err;
-        }
 
         return sock;
 
@@ -147,6 +142,70 @@ err:
         return sock;
 }
 
+int
+nfs_rpcsvc_udp_socket_listen (int addrfam, char *listenhost, uint16_t listenport)
+{
+        int                     sock = -1;
+        struct sockaddr_storage sockaddr;
+        socklen_t               sockaddr_len;
+        int                     flags = 0;
+        int                     ret = -1;
+        int                     opt = 1;
+
+        ret = nfs_rpcsvc_socket_server_get_local_socket (addrfam, listenhost,
+                                                         listenport,
+                                                         SA (&sockaddr),
+                                                         &sockaddr_len);
+
+        if (ret == -1)
+                return ret;
+
+        sock = socket (SA (&sockaddr)->sa_family, SOCK_DGRAM, 0);
+        if (sock == -1) {
+                gf_log (GF_RPCSVC_SOCK, GF_LOG_ERROR, "socket creation failed"
+                        " (%s)", strerror (errno));
+                goto err;
+        }
+
+        flags = fcntl (sock, F_GETFL);
+        if (flags == -1) {
+                gf_log (GF_RPCSVC_SOCK, GF_LOG_ERROR, "cannot get socket flags"
+                        " (%s)", strerror(errno));
+                goto close_err;
+        }
+
+        ret = fcntl (sock, F_SETFL, flags | O_NONBLOCK);
+        if (ret == -1) {
+                gf_log (GF_RPCSVC_SOCK, GF_LOG_ERROR, "cannot set socket "
+                        "non-blocking (%s)", strerror (errno));
+                goto close_err;
+        }
+
+        ret = setsockopt (sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof (opt));
+        if (ret == -1) {
+                gf_log (GF_RPCSVC_SOCK, GF_LOG_ERROR, "setsockopt() for "
+                        "SO_REUSEADDR failed (%s)", strerror (errno));
+                goto close_err;
+        }
+
+        ret = bind (sock, (struct sockaddr *)&sockaddr, sockaddr_len);
+        if (ret == -1) {
+                if (errno != EADDRINUSE) {
+                        gf_log (GF_RPCSVC_SOCK, GF_LOG_ERROR, "binding socket "
+                                "failed: %s", strerror (errno));
+                        goto close_err;
+                }
+        }
+
+        return sock;
+
+close_err:
+        close (sock);
+        sock = -1;
+
+err:
+        return sock;
+}
 
 int
 nfs_rpcsvc_socket_accept (int listenfd)
@@ -224,12 +283,38 @@ nfs_rpcsvc_socket_read (int sockfd, char *readaddr, size_t readsize)
         return dataread;
 }
 
+ssize_t
+nfs_rpcsvc_udp_socket_read (rpcsvc_conn_t *conn,
+                            int sockfd, char *readaddr, size_t readsize)
+{
+        ssize_t         dataread = 0;
+        ssize_t         readlen = -1;
+
+        if (!readaddr)
+                return -1;
+
+        conn->sockaddrlen = sizeof (conn->addr);
+        readlen = recvfrom (sockfd, readaddr, readsize,
+                            0, &conn->addr, &conn->sockaddrlen);
+        if (readlen == -1) {
+                if (errno != EAGAIN) {
+                        dataread = -1;
+                }
+                goto out;
+        }
+        conn->is_udp = 1;
+
+        dataread += readlen;
+out:
+        return dataread;
+}
 
 ssize_t
 nfs_rpcsvc_socket_write (int sockfd, char *buffer, size_t size, int *eagain)
 {
         size_t          writelen = -1;
         ssize_t         written = 0;
+        int             myerrno = 0;
 
         if (!buffer)
                 return -1;
@@ -237,6 +322,7 @@ nfs_rpcsvc_socket_write (int sockfd, char *buffer, size_t size, int *eagain)
         while (size > 0) {
                 writelen = write (sockfd, buffer, size);
                 if (writelen == -1) {
+                        myerrno = errno;
                         if (errno != EAGAIN) {
                                 written = -1;
                                 break;
@@ -255,6 +341,38 @@ nfs_rpcsvc_socket_write (int sockfd, char *buffer, size_t size, int *eagain)
         return written;
 }
 
+ssize_t
+nfs_rpcsvc_udp_write (rpcsvc_conn_t *conn,
+                         int sockfd, char *buffer, size_t size)
+{
+        size_t          writelen = -1;
+        ssize_t         written = 0;
+        int             myerrno = 0;
+
+        if (!buffer)
+                return -1;
+
+        while (size > 0) {
+                writelen = sendto (sockfd, buffer, size, 0,
+                                   &conn->addr, conn->sockaddrlen);
+                if (writelen == -1) {
+                        myerrno = errno;
+                        if (errno != EAGAIN) {
+                                written = -1;
+                                gf_log ("", GF_LOG_ERROR, "Udp write failed, errno: %d",
+                                        errno);
+                                break;
+                        }
+                } else if (writelen == 0)
+                        break;
+
+                written += writelen;
+                size -= writelen;
+                buffer += writelen;
+        }
+
+        return written;
+}
 
 int
 nfs_rpcsvc_socket_peername (int sockfd, char *hostname, int hostlen)

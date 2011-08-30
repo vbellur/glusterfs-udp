@@ -128,6 +128,14 @@ nfs_init_versions (struct nfs_state *nfs, xlator_t *this)
                         gf_log (GF_NFS, GF_LOG_ERROR, "Program init failed");
                         goto err;
                 }
+
+                if (strcmp (prog->progname, "NFS3")) {
+                        ret = nfs_rpcsvc_udp_program_register (nfs->rpcsvc, *prog);
+                        if (ret == -1) {
+                                gf_log (GF_NFS, GF_LOG_ERROR, "UDP Program init failed");
+                                goto err;
+                        }
+                }
         }
 
         ret = 0;

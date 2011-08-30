@@ -62,4 +62,15 @@ nfs_rpcsvc_socket_block_tx (int sockfd);
 
 extern int
 nfs_rpcsvc_socket_unblock_tx (int sockfd);
+
+extern int
+nfs_rpcsvc_udp_socket_listen (int addrfam, char *listenhost, uint16_t listenport);
+
+extern ssize_t
+nfs_rpcsvc_udp_socket_read (rpcsvc_conn_t *conn,
+                            int sockfd, char *readaddr, size_t readsize);
+
+ssize_t
+nfs_rpcsvc_udp_write (rpcsvc_conn_t *conn,
+                      int sockfd, char *buffer, size_t size);
 #endif

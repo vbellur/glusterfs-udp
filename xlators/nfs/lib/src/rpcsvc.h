@@ -263,6 +263,9 @@ typedef struct rpc_conn_state {
          * more data to be got from the network.
          */
         rpcsvc_request_t        *vectoredreq;
+        struct sockaddr         addr;
+        socklen_t               sockaddrlen;
+        gf_boolean_t            is_udp;
 } rpcsvc_conn_t;
 
 
@@ -728,4 +731,7 @@ nfs_rpcsvc_combine_gen_spec_volume_checks (int gen, int spec);
 
 extern char *
 nfs_rpcsvc_volume_allowed (dict_t *options, char *volname);
+
+extern int
+nfs_rpcsvc_udp_program_register (rpcsvc_t *svc, rpcsvc_program_t program);
 #endif
