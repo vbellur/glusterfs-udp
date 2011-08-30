@@ -333,12 +333,36 @@ __socket_server_bind (rpc_transport_t *this)
                 }
         }
 
+        ret = setsockopt (priv->udp_sock, SOL_SOCKET, SO_REUSEADDR,
+                          &opt, sizeof (opt));
+
+        if (ret == -1) {
+                gf_log (this->name, GF_LOG_ERROR,
+                        "setsockopt() for SO_REUSEADDR failed (%s)",
+                        strerror (errno));
+        }
+
         ret = bind (priv->sock, (struct sockaddr *)&this->myinfo.sockaddr,
                     this->myinfo.sockaddr_len);
 
         if (ret == -1) {
                 gf_log (this->name, GF_LOG_ERROR,
                         "binding to %s failed: %s",
+                        this->myinfo.identifier, strerror (errno));
+                if (errno == EADDRINUSE) {
+                        gf_log (this->name, GF_LOG_ERROR,
+                                "Port is already in use");
+                }
+        }
+
+        if (AF_UNIX == SA (&this->myinfo.sockaddr)->sa_family)
+                goto out;
+
+        ret = bind (priv->udp_sock, (struct sockaddr *)&this->myinfo.sockaddr,
+                    this->myinfo.sockaddr_len);
+        if (ret == -1) {
+                gf_log (this->name, GF_LOG_ERROR,
+                        "udp binding to %s failed: %s",
                         this->myinfo.identifier, strerror (errno));
                 if (errno == EADDRINUSE) {
                         gf_log (this->name, GF_LOG_ERROR,
@@ -1916,6 +1940,146 @@ out:
         return ret;
 }
 
+int
+socket_udp_server_event_handler (int fd, int idx, void *data,
+                                 int poll_in, int poll_out, int poll_err)
+{
+        rpc_transport_t             *this = NULL;
+        socket_private_t        *priv = NULL;
+        int                      ret = 0;
+        int                      new_sock = -1;
+        rpc_transport_t             *new_trans = NULL;
+        struct sockaddr_storage  new_sockaddr = {0, };
+        socklen_t                addrlen = sizeof (new_sockaddr);
+        socket_private_t        *new_priv = NULL;
+        glusterfs_ctx_t         *ctx = NULL;
+
+        this = data;
+        GF_VALIDATE_OR_GOTO ("socket", this, out);
+        GF_VALIDATE_OR_GOTO ("socket", this->private, out);
+        GF_VALIDATE_OR_GOTO ("socket", this->xl, out);
+
+        THIS = this->xl;
+        priv = this->private;
+        ctx  = this->ctx;
+
+        pthread_mutex_lock (&priv->lock);
+        {
+                priv->udp_idx = idx;
+
+                if (poll_in) {
+                        new_sock = accept (priv->udp_sock, SA (&new_sockaddr),
+                                           &addrlen);
+
+                        if (new_sock == -1) {
+                                gf_log (this->name, GF_LOG_WARNING,
+                                        "accept on %d failed (%s)",
+                                        priv->udp_sock, strerror (errno));
+                                goto unlock;
+                        }
+
+                        if (!priv->bio) {
+                                ret = __socket_nonblock (new_sock);
+
+                                if (ret == -1) {
+                                        gf_log (this->name, GF_LOG_WARNING,
+                                                "NBIO on %d failed (%s)",
+                                                new_sock, strerror (errno));
+
+                                        close (new_sock);
+                                        goto unlock;
+                                }
+                        }
+
+                        if (priv->nodelay) {
+                                ret = __socket_nodelay (new_sock);
+                                if (ret == -1) {
+                                        gf_log (this->name, GF_LOG_WARNING,
+                                                "setsockopt() failed for "
+                                                "NODELAY (%s)",
+                                                strerror (errno));
+                                }
+                        }
+
+                        if (priv->keepalive) {
+                                ret = __socket_keepalive (new_sock,
+                                                          priv->keepaliveintvl,
+                                                          priv->keepaliveidle);
+                                if (ret == -1)
+                                        gf_log (this->name, GF_LOG_WARNING,
+                                                "Failed to set keep-alive: %s",
+                                                strerror (errno));
+                        }
+
+                        new_trans = GF_CALLOC (1, sizeof (*new_trans),
+                                               gf_common_mt_rpc_trans_t);
+                        if (!new_trans)
+                                goto unlock;
+
+                        new_trans->name = gf_strdup (this->name);
+
+                        memcpy (&new_trans->peerinfo.sockaddr, &new_sockaddr,
+                                addrlen);
+                        new_trans->peerinfo.sockaddr_len = addrlen;
+
+                        new_trans->myinfo.sockaddr_len =
+                                sizeof (new_trans->myinfo.sockaddr);
+
+                        ret = getsockname (new_sock,
+                                           SA (&new_trans->myinfo.sockaddr),
+                                           &new_trans->myinfo.sockaddr_len);
+                        if (ret == -1) {
+                                gf_log (this->name, GF_LOG_WARNING,
+                                        "getsockname on %d failed (%s)",
+                                        new_sock, strerror (errno));
+                                close (new_sock);
+                                goto unlock;
+                        }
+
+                        get_transport_identifiers (new_trans);
+                        socket_init (new_trans);
+                        new_trans->ops = this->ops;
+                        new_trans->init = this->init;
+                        new_trans->fini = this->fini;
+                        new_trans->ctx  = ctx;
+                        new_trans->xl   = this->xl;
+                        new_trans->mydata = this->mydata;
+                        new_trans->notify = this->notify;
+                        new_trans->listener = this;
+                        new_priv = new_trans->private;
+
+                        pthread_mutex_lock (&new_priv->lock);
+                        {
+                                new_priv->sock = new_sock;
+                                new_priv->connected = 1;
+                                rpc_transport_ref (new_trans);
+
+                                new_priv->idx =
+                                        event_register (ctx->event_pool,
+                                                        new_sock,
+                                                        socket_event_handler,
+                                                        new_trans, 1, 0);
+
+                                if (new_priv->idx == -1)
+                                        ret = -1;
+                        }
+                        pthread_mutex_unlock (&new_priv->lock);
+                        if (ret == -1) {
+                                gf_log ("", GF_LOG_WARNING,
+                                        "failed to register the socket with event");
+                                goto unlock;
+                        }
+
+                        ret = rpc_transport_notify (this, RPC_TRANSPORT_ACCEPT,
+                                                    new_trans);
+                }
+        }
+unlock:
+        pthread_mutex_unlock (&priv->lock);
+
+out:
+        return ret;
+}
 
 int
 socket_disconnect (rpc_transport_t *this)
@@ -2160,6 +2324,15 @@ socket_listen (rpc_transport_t *this)
                         goto unlock;
                 }
 
+                priv->udp_sock = socket (AF_INET, SOCK_DGRAM, 0);
+
+                if (priv->udp_sock == -1) {
+                        gf_log (this->name, GF_LOG_ERROR,
+                                "udp socket creation failed (%s)",
+                                strerror (errno));
+                        goto unlock;
+                }
+
                 /* Cant help if setting socket options fails. We can continue
                  * working nonetheless.
                  */
@@ -2239,6 +2412,21 @@ socket_listen (rpc_transport_t *this)
                         ret = -1;
                         close (priv->sock);
                         priv->sock = -1;
+                        goto unlock;
+                }
+
+                priv->udp_idx = event_register (ctx->event_pool,
+                                                priv->udp_sock,
+                                                socket_server_event_handler,
+                                                this, 1, 0);
+
+                if (priv->udp_idx == -1) {
+                        gf_log (this->name, GF_LOG_WARNING,
+                                "could not register socket %d with events",
+                                priv->udp_sock);
+                        ret = -1;
+                        close (priv->udp_sock);
+                        priv->udp_sock = -1;
                         goto unlock;
                 }
         }
